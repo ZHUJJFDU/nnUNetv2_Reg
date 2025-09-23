@@ -4,8 +4,7 @@ from typing import List, Dict, Union, Tuple
 
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import join, load_pickle, isfile, isdir
-from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
-from nnunetv2.training.dataloading.utils import get_case_identifiers
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetNumpy as nnUNetDataset
 
 
 class RegnnUNetDataset(nnUNetDataset):
@@ -183,4 +182,4 @@ class RegnnUNetDataset(nnUNetDataset):
                             return self.load_case(key)
 
             # If we couldn't fix it, raise the original error
-            raise e 
+            raise e

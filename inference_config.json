@@ -1,0 +1,37 @@
+{
+  "model": {
+    "model_folder": "c:/Users/Administrator/Desktop/nnUNet_master/DATASET/nnUNet_trained_models/Dataset102_quan/SemiSupervisedTrainer__nnUNetPlans__3d_fullres",
+    "checkpoint_name": "checkpoint_best.pth",
+    "use_folds": null,
+    "use_teacher_model": false
+  },
+  "inference": {
+    "device": "cuda",
+    "tile_step_size": 0.5,
+    "use_gaussian": true,
+    "use_mirroring": true,
+    "perform_everything_on_gpu": true,
+    "save_probabilities": false,
+    "overwrite": true
+  },
+  "processing": {
+    "num_processes_preprocessing": 8,
+    "num_processes_segmentation_export": 8,
+    "allow_tqdm": true,
+    "verbose": true
+  },
+  "paths": {
+    "input_folder": "path/to/input/images",
+    "output_folder": "path/to/output/predictions"
+  },
+  "examples": {
+    "single_image": {
+      "input": "path/to/single/image.nii.gz",
+      "output": "path/to/output/prediction.nii.gz"
+    },
+    "batch_prediction": {
+      "input_folder": "path/to/input/folder",
+      "output_folder": "path/to/output/folder"
+    }
+  }
+}

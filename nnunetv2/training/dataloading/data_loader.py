@@ -82,10 +82,18 @@ class nnUNetDataLoader(DataLoader):
         num_color_channels = data.shape[0]
 
         data_shape = (self.batch_size, num_color_channels, *self.patch_size)
-        channels_seg = seg.shape[0]
-        if seg_prev is not None:
-            channels_seg += 1
-        seg_shape = (self.batch_size, channels_seg, *self.patch_size)
+        
+        # 处理无标签数据的情况（seg为None）
+        if seg is not None:
+            channels_seg = seg.shape[0]
+            if seg_prev is not None:
+                channels_seg += 1
+            seg_shape = (self.batch_size, channels_seg, *self.patch_size)
+        else:
+            # 无标签数据，设置默认的分割通道数
+            channels_seg = 1  # 默认单通道分割
+            seg_shape = (self.batch_size, channels_seg, *self.patch_size)
+            
         return data_shape, seg_shape
 
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
@@ -187,10 +195,17 @@ class nnUNetDataLoader(DataLoader):
             # use ACVL utils for that. Cleaner.
             data_all[j] = crop_and_pad_nd(data, bbox, 0)
 
-            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
-            if seg_prev is not None:
-                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
-            seg_all[j] = seg_cropped
+            # 处理无标签数据的情况（seg为None）
+            if seg is not None:
+                seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+                if seg_prev is not None:
+                    seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+                seg_all[j] = seg_cropped
+            else:
+                # 无标签数据，创建虚拟分割（全零）
+                patch_shape = [bbox[i][1] - bbox[i][0] for i in range(len(bbox))]
+                dummy_seg = np.zeros((1, *patch_shape), dtype=np.int16)
+                seg_all[j] = dummy_seg
 
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]

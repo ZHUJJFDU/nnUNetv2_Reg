@@ -1,0 +1,114 @@
+{
+  "description": "半监督训练配置文件模板",
+  "version": "1.0",
+  
+  "dataset": {
+    "name_or_id": "Dataset102_quan",
+    "configuration": "3d_fullres",
+    "fold": 0,
+    "plans_identifier": "nnUNetPlans"
+  },
+  
+  "trainer": {
+    "class_name": "SemiSupervisedTrainer",
+    "device": "cuda",
+    "num_epochs":550,
+    "continue_training": false,
+    "validation_only": false,
+    "disable_checkpointing": false,
+    "save_best_checkpoint": true,
+    "save_final_checkpoint": true
+  },
+  
+  "semi_supervised": {
+    "teacher_checkpoint_path": "c:/Users/Administrator/Desktop/nnUNet_master/DATASET/nnUNet_trained_models/Dataset102_quan/nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth",
+    "unlabeled_data_path": "c:/Users/Administrator/Desktop/nnUNet_master/DATASET/nnUNet_preprocessed/Dataset102_quan/SeminnUNet",
+    "ema_decay": 0.99,
+    "consistency_weight": 1.0,
+    "consistency_ramp_up_epochs": 50,
+    "unlabeled_batch_size": 4,
+    "labeled_ratio_in_batch": 0.5
+  },
+  
+  "augmentation": {
+    "strong_augmentation_student": true,
+    "weak_augmentation_teacher": true,
+    "augmentation_strength": {
+      "rotation_range": [-15, 15],
+      "scaling_range": [0.85, 1.15],
+      "elastic_deformation": true,
+      "gaussian_noise": true,
+      "gaussian_blur": true,
+      "brightness_range": [0.8, 1.2],
+      "contrast_range": [0.8, 1.2]
+    }
+  },
+  
+  "pseudo_labeling": {
+    "confidence_threshold": 0.8,
+    "use_entropy_filtering": true,
+    "entropy_threshold": 1.0,
+    "quality_filtering": {
+      "min_foreground_ratio": 0.01,
+      "max_background_ratio": 0.99
+    }
+  },
+  
+  "loss": {
+    "supervised_loss": {
+      "dice_weight": 1.0,
+      "ce_weight": 1.0
+    },
+    "consistency_loss": {
+      "type": "mse",
+      "weight_schedule": "linear",
+      "max_weight": 1.0,
+      "ramp_up_epochs": 50
+    }
+  },
+  
+  "logging": {
+    "log_interval": 10,
+    "save_interval": 1,
+    "validation_interval": 25,
+    "tensorboard_logging": true,
+    "save_latest_only": false
+  },
+  
+  "output": {
+    "base_folder": null,
+    "experiment_name": "semi_supervised_experiment",
+    "save_predictions": true,
+    "save_probabilities": false
+  },
+  
+  "data_loading": {
+    "num_threads_for_batchgenerators": 12,
+    "oversample_foreground_percent": 0.33,
+    "patch_size": null,
+    "batch_size": 4
+  },
+  
+  "optimization": {
+    "initial_lr": 0.01,
+    "weight_decay": 3e-5,
+    "momentum": 0.99,
+    "lr_scheduler": "poly",
+    "poly_lr_power": 0.9
+  },
+  
+  "validation": {
+    "validation_step_skip": 1,
+    "save_probabilities": false,
+    "overwrite_validation": true,
+    "use_mirroring": true,
+    "use_sliding_window": true
+  },
+  
+  "experimental": {
+    "use_mixed_precision": true,
+    "compile_model": true,
+    "deep_supervision": true,
+    "ddp_find_unused_parameters": false
+  }
+}
