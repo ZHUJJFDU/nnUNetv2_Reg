@@ -574,10 +574,27 @@ class nnUNetTrainer(object):
                                          folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
             # if the split file does not exist we need to create it
             if not isfile(splits_file):
-                self.print_to_log_file("Creating new 5-fold cross-validation split...")
                 all_keys_sorted = list(np.sort(list(dataset.identifiers)))
-                splits = generate_crossval_split(all_keys_sorted, seed=12345, n_splits=5)
-                save_json(splits, splits_file)
+                n_total = len(all_keys_sorted)
+                if n_total >= 5:
+                    self.print_to_log_file("Creating new 5-fold cross-validation split...")
+                    splits = generate_crossval_split(all_keys_sorted, seed=12345, n_splits=5)
+                    save_json(splits, splits_file)
+                elif n_total >= 2:
+                    n_splits = n_total
+                    self.print_to_log_file(f"Creating new {n_splits}-fold cross-validation split (dataset size {n_total})...")
+                    splits = generate_crossval_split(all_keys_sorted, seed=12345, n_splits=n_splits)
+                    save_json(splits, splits_file)
+                else:
+                    self.print_to_log_file("Dataset too small for cross-validation, creating a random 80:20 split")
+                    rnd = np.random.RandomState(seed=12345)
+                    keys = np.sort(list(dataset.identifiers))
+                    idx_tr = rnd.choice(len(keys), int(max(1, len(keys) * 0.8)), replace=False)
+                    idx_val = [i for i in range(len(keys)) if i not in idx_tr]
+                    tr_keys = [keys[i] for i in idx_tr]
+                    val_keys = [keys[i] for i in idx_val] if len(idx_val) > 0 else tr_keys
+                    splits = [{'train': list(tr_keys), 'val': list(val_keys)}]
+                    save_json(splits, splits_file)
 
             else:
                 self.print_to_log_file("Using splits from existing split file:", splits_file)

@@ -1,126 +1,81 @@
+# nnUNet_Reg 三阶段训练与实现说明
 
+## 概述
+- 扩展 nnU-Net v2 实现三阶段：全监督分割预训练 → 半监督师生训练 → 双解码器回归训练
+- 任务：肺大泡分割与厚度回归；支持不确定性指导的鲁棒知识蒸馏与第三阶段知识锁定
 
-## 三阶段训练指南（本仓库扩展）
+## 已实现
+- 半监督（阶段1 → 阶段2）
+  - 师生双路无标签增强：教师弱增强、学生强增强
+  - EMA 教师权重与一致性损失
+  - 不确定性掩码：置信度或熵过滤低质量伪标签（仅高置信区域蒸馏）
+  - 强制 `unlabeled_data_path`；或按数据集自动推断到 `nnUNet_preprocessed/<dataset>/SeminnUNet`
+  - 多线程增广封装与原生一致
+- 双解码器回归（阶段2 → 阶段3）
+  - 切换网络为 `DualDecoderRegCBAMUNet`，编码器与分割解码器键名对齐原生（`encoder.*`、`decoder.*`）
+  - 加载第二阶段检查点仅载入编码器与分割解码器权重，回归解码器随机初始化
+  - 知识锁定：冻结分割解码器（或单解码器的 `decoder.seg_layers`）
+  - 回归数据集/加载器统一：`nnunetv2/training/dataloading/reg_dataloader.py`
+  - 回归损失迁移：`nnunetv2/training/loss/reg_loss.py`
+- 推理
+  - 单文件入口：`regression_inference.py`（滑窗与镜像集成，输出回归结果 JSON）
 
-本仓库在nnU-Net v2基础上，提供“全监督分割预训练 → 半监督师生训练 → 双解码器回归训练”的三阶段流程。以下为在 Windows PowerShell 环境下的实操说明。
+## 待完善
+- 解剖学先验引导注意力（边缘导向）：将“肺大泡边缘”编码为空间先验调制跨任务注意力
+- 特征对齐损失（阶段1→2、2→3）：编码器/中间层 L2 或余弦对齐
 
-### 前置准备
-- 设置环境变量（建议使用绝对路径）：
-
+## 数据集组织
+- 环境变量（绝对路径）
 ```
-$env:nnUNet_raw='C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw'
-$env:nnUNet_preprocessed='C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_preprocessed'
-$env:nnUNet_results='C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models'
+$env:nnUNet_raw='C:\path\to\DATASET\nnUNet_raw'
+$env:nnUNet_preprocessed='C:\path\to\DATASET\nnUNet_preprocessed'
+$env:nnUNet_results='C:\path\to\DATASET\nnUNet_trained_models'
 ```
-
-- 数据计划与预处理（任选其一）：
-
+- 预处理（任选其一）
 ```
-# 命令行入口（若已安装nnUNet v2 CLI）
 nnUNetv2_plan_and_preprocess -d 102 -c 3d_fullres
-
-# 纯脚本方式（不依赖CLI安装）
 python -m nnunetv2.experiment_planning.plan_and_preprocess_entrypoints nnUNetv2_plan_and_preprocess -d 102 -c 3d_fullres
 ```
+- 无标签数据（默认路径）
+  - `nnUNet_preprocessed/<dataset>/SeminnUNet` 下 `.npz/.pkl` 结构与原生一致
+- 回归数值文件
+  - `nnUNet_preprocessed/<dataset>/regression_values.json`
+  - 支持 `{ "case_id": value }` 或 `{ "case_id": { "bulla_thickness": value } }`（用 `--reg_key` 指定键名）
 
-- 可选：指定使用的GPU（例如只用第0张）：
-
-```
-$env:CUDA_VISIBLE_DEVICES='0'
-```
-
-> 说明：文中 `Dataset102_quan` 为示例数据集名，你也可以用数据集ID（例如 `102`）。配置名如 `3d_fullres`、`2d` 等请按你的数据规划结果选择。
-
-### 阶段1：全监督分割预训练（训练教师模型）
-- 作用：使用有标签数据训练鲁棒的分割教师模型。
-- 单折训练示例：
-
+## 训练流程
+- 阶段1：全监督分割
 ```
 python nnunetv2/run/run_training.py Dataset102_quan 3d_fullres 0
-```
-
-- 全折训练（5折）：
-
-```
+# 或 5折
 python nnunetv2/run/run_training.py Dataset102_quan 3d_fullres all
 ```
+输出：`$env:nnUNet_results/Dataset102_quan/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth`
 
-- 典型输出：
+- 阶段2：半监督师生（鲁棒KD）
+```
+python run_semi_training.py Dataset102_quan 3d_fullres 0 -teacher_checkpoint C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\nnUNetTrainer_500epochs__nnUNetPlans__3d_fullres\fold_0\checkpoint_best.pth -u C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_preprocessed\Dataset102_quan\SeminnUNet
 
 ```
-C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\nnUNetTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_final.pth
+输出：`$env:nnUNet_results/Dataset102_quan/SemiSupervisedTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_latest.pth`
+
+- 阶段3：双解码器回归（知识锁定）
 ```
-
-### 阶段2：半监督训练（师生一致性框架）
-- 作用：结合大量无标签数据，通过一致性损失与EMA教师更新提升学生模型泛化。
-- 便捷封装入口（推荐）：
-
+python run_regression_training.py \
+  -d Dataset102_quan -c 3d_fullres -f 0 --device cuda \
+  --pretrained_weights C:\path\to\...\SemiSupervisedTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_latest.pth \
+  --reg_weight 1.0 --reg_key bulla_thickness
 ```
-python run_semi_supervised_training.py \
-  -d Dataset102_quan -c 3d_fullres -f 0 \
-  -t C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\nnUNetTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_final.pth \
-  -u C:\path\to\unlabeled_images \
-  --ema_decay 0.995 --consistency_weight 0.5 --consistency_ramp_up 50 \
-  --epochs 300 --device cuda -o C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models
+说明：第三阶段切换 `DualDecoderRegCBAMUNet`，仅加载编码器与分割解码器权重并冻结分割解码器。
+
+## 推理
 ```
-
-- 原始脚本入口（最小示例）：
-
+python regression_inference.py -i <input_folder> -o <output_folder> -m <model_folder> -c checkpoint_final.pth
 ```
-python nnunetv2/training/nnUNetTrainer/train_semi_supervised.py -d 102 -c 3d_fullres -f 0 --unlabeled_data_path C:\path\to\unlabeled_images
-```
+输出：分割结果与 `<output_folder>/regression_results.json`。
 
-- 关键参数说明：
-  - `-t/--teacher_checkpoint`：阶段1教师模型权重路径。
-  - `-u/--unlabeled_data`：无标签数据文件夹。
-  - `--ema_decay`：EMA衰减（常用 0.99–0.999）。
-  - `--consistency_weight` / `--consistency_ramp_up`：一致性损失强度及暖启动轮数。
-  - `--epochs`：训练轮数；`--device`：`cuda` 或 `cpu`。
+## 注意事项
+- 所有输出按 `数据集/训练器/配置/折` 组织在 `$env:nnUNet_results` 下
+- 半监督阶段一致性权重建议暖启动；可启用熵过滤
+- 第三阶段默认冻结分割解码器；如需联合微调可在训练器中取消冻结
+- 遇 AMP 或类型不匹配报错可在第三阶段禁用 AMP
 
-- 典型输出：
-
-```
-C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\SemiSupervisedTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_latest.pth
-```
-
-### 阶段3：双解码器回归训练（保留分割能力同时学习回归）
-- 作用：加载阶段2学生模型权重，冻结分割解码器，仅训练回归解码器与交叉注意力模块。
-
-- 方案A（示例脚本，便于快速起步）：
-
-```
-python .\train_dual_decoder_regression_example.py
-```
-
-> 使用前请在脚本中替换：`pretrained_checkpoint_path` 指向阶段2输出；将 `DummyRegressionDataset` 替换为你的真实数据集；根据任务调整 `num_classes`、`regression_dim`、损失权重等。
-
-- 方案B（通用入口，更易融入现有流程）：
-
-```
-python nnunetv2/run/run_regression_training.py Dataset102_quan 3d_fullres 0 \
-  -tr PretrainedDualDecoderRegressionTrainer \
-  -pretrained_weights C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\SemiSupervisedTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_latest.pth \
-  -reg_weight 1.0 -reg_loss mse --disable_amp -device cuda
-```
-
-- 多卡训练（例如2卡）：
-
-```
-$env:CUDA_VISIBLE_DEVICES='0,1'
-python nnunetv2/run/run_regression_training.py Dataset102_quan 3d_fullres 0 -tr PretrainedDualDecoderRegressionTrainer -num_gpus 2
-```
-
-- 典型输出：
-
-```
-C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\PretrainedDualDecoderRegressionTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_final.pth
-```
-
-### 常见路径与注意事项
-- 所有训练输出按 `数据集/训练器/配置/折` 组织在 `$env:nnUNet_results` 下。
-- 半监督阶段需可用的教师权重与无标签数据目录；一致性损失建议随训练逐步加权。
-- 双解码器阶段默认冻结分割解码器；如需联合微调可在训练器内取消冻结。
-- 如遇数据类型不匹配或AMP相关报错，可在回归阶段加 `--disable_amp`。
-- 回归数值如从外部文件加载，确保键名与 `-reg_key` 一致（默认 `reg`），并准备 `regression_values.json`。
-
-如需我基于你的实际数据路径与配置，生成三阶段的精确命令，请告知数据集名称/ID、折数、无标签数据目录与目标回归维度等信息。

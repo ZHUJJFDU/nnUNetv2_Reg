@@ -282,8 +282,8 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
         
         # CBAM模块已移除，使用轻量级设计
         
-        # 创建分割解码器
-        self.seg_decoder = UNetDecoder(
+        # 创建分割解码器（命名为decoder以与PlainConvUNet保持一致）
+        segmentation_decoder = UNetDecoder(
             self.encoder,
             num_classes,
             n_conv_per_stage_decoder,
@@ -297,6 +297,10 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
             nonlin_kwargs,
             conv_bias
         )
+        # 移除嵌套的encoder注册，避免state_dict中出现decoder.encoder.*
+        if 'encoder' in segmentation_decoder._modules:
+            del segmentation_decoder._modules['encoder']
+        self.decoder = segmentation_decoder
         
         # 创建回归解码器
         self.reg_decoder = RegressionDecoder(
@@ -326,7 +330,7 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
             for stage_idx in range(n_stages - 1):
                 if stage_idx in cross_attention_stages:
                     # 获取分割解码器该阶段的输出通道数
-                    seg_channels = self.seg_decoder.stages[stage_idx].output_channels
+                    seg_channels = self.decoder.stages[stage_idx].output_channels
                     # 获取回归解码器该阶段的输出通道数
                     # 注意：回归解码器返回的特征是反序的，所以需要调整索引
                     reg_stage_idx = (n_stages - 1) - 1 - stage_idx  # 反向映射
@@ -340,10 +344,6 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
         
         # 存储deep supervision设置
         self.deep_supervision = deep_supervision
-        
-        # 添加decoder属性以兼容nnUNet框架
-        # nnUNet期望有这个属性来设置深度监督
-        self.decoder = self.seg_decoder
         
     def forward(self, x):
         """
@@ -367,24 +367,18 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
             lres_input = enhanced_skips[-1]
             seg_outputs = []
             
-            for s in range(len(self.seg_decoder.stages)):
-                # 分割解码器的上采样和卷积
-                x_seg = self.seg_decoder.transpconvs[s](lres_input)
+            for s in range(len(self.decoder.stages)):
+                x_seg = self.decoder.transpconvs[s](lres_input)
                 x_seg = torch.cat((x_seg, enhanced_skips[-(s+2)]), 1)
-                x_seg = self.seg_decoder.stages[s](x_seg)
-                
-                # 应用交叉注意力 - 确保索引正确
+                x_seg = self.decoder.stages[s](x_seg)
                 if (s < len(self.cross_attention_modules) and 
                     self.cross_attention_modules[s] is not None and
                     s < len(reg_features)):
                     x_seg, reg_features[s] = self.cross_attention_modules[s](x_seg, reg_features[s])
-                
-                # 生成分割输出
-                if self.seg_decoder.deep_supervision:
-                    seg_outputs.append(self.seg_decoder.seg_layers[s](x_seg))
-                elif s == (len(self.seg_decoder.stages) - 1):
-                    seg_outputs.append(self.seg_decoder.seg_layers[-1](x_seg))
-                
+                if self.decoder.deep_supervision:
+                    seg_outputs.append(self.decoder.seg_layers[s](x_seg))
+                elif s == (len(self.decoder.stages) - 1):
+                    seg_outputs.append(self.decoder.seg_layers[-1](x_seg))
                 lres_input = x_seg
                 seg_features.append(x_seg)
             
@@ -393,7 +387,7 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
             
         else:
             # 独立解码（无交叉注意力）
-            seg_outputs = self.seg_decoder(enhanced_skips)
+            seg_outputs = self.decoder(enhanced_skips)
             _, reg_output = self.reg_decoder(enhanced_skips)
         
         # 返回结果
@@ -404,7 +398,7 @@ class DualDecoderRegCBAMUNet(AbstractDynamicNetworkArchitectures):
     
     def compute_conv_feature_map_size(self, input_size):
         """计算卷积特征图大小"""
-        seg_size = self.seg_decoder.compute_conv_feature_map_size(input_size)
+        seg_size = self.decoder.compute_conv_feature_map_size(input_size)
         
         # 简单估算回归解码器的大小（与分割解码器类似）
         reg_size = seg_size * 0.8  # 回归解码器稍小

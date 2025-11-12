@@ -14,14 +14,17 @@ from torch import nn
 from torch import distributed as dist
 from torch.cuda import device_count
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch._dynamo import OptimizedModule
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
+from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.regression.reg_dataset import RegnnUNetDataset
-from nnunetv2.regression.reg_dataloader import RegnnUNetDataLoader
-from nnunetv2.regression.reg_loss import DC_and_CE_and_Regression_loss
+from nnunetv2.training.dataloading.reg_dataloader import RegnnUNetDataLoader
+from nnunetv2.training.dataloading.reg_dataloader import RegnnUNetDataset as RegDataset
+from nnunetv2.training.loss.reg_loss import DC_and_CE_and_Regression_loss
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
-from nnunetv2.regression.reg_predictor import RegnnUNetPredictor
+from regression_inference import RegPredictor as RegnnUNetPredictor
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
@@ -34,8 +37,8 @@ class RegnnUNetTrainer(nnUNetTrainer):
     """
     nnUNetTrainer extension that supports regression alongside segmentation
     """
-    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, 
-                 unpack_dataset: bool = True, device: torch.device = torch.device('cuda')):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
         """
         Initialize RegnnUNetTrainer
         
@@ -81,7 +84,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
         self.deep_supervision = True
         
         # Call parent init
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        super().__init__(plans, configuration, fold, dataset_json, device)
 
     def set_regression_parameters(self, reg_weight=1.0, reg_loss='mse', reg_key='reg', debug=True):
         """
@@ -103,8 +106,63 @@ class RegnnUNetTrainer(nnUNetTrainer):
         """
         Initialize trainer with regression support
         """
-        # Call parent initialize
+        # Call parent initialize (builds default network)
         super().initialize()
+
+        # Hardcode DualDecoderRegCBAMUNet for regression fine-tuning
+        try:
+            arch_class_name = "dynamic_network_architectures.architectures.dual_decoder_regression_cbamunet.DualDecoderRegCBAMUNet"
+            arch_kwargs = dict(**self.configuration_manager.network_arch_init_kwargs)
+            if 'n_blocks_per_stage' in arch_kwargs and 'n_conv_per_stage' not in arch_kwargs:
+                arch_kwargs['n_conv_per_stage'] = arch_kwargs.pop('n_blocks_per_stage')
+            arch_kwargs['regression_dim'] = 1
+            arch_kwargs['enable_cross_attention'] = True
+            req_import = self.configuration_manager.network_arch_init_kwargs_req_import
+            new_net = get_network_from_plans(
+                arch_class_name,
+                arch_kwargs,
+                req_import,
+                self.num_input_channels,
+                self.label_manager.num_segmentation_heads,
+                allow_init=True,
+                deep_supervision=self.enable_deep_supervision
+            ).to(self.device)
+            self.network = new_net
+            self.print_to_log_file("Switched to DualDecoderRegCBAMUNet for regression fine-tuning")
+        except Exception as e:
+            self.print_to_log_file(f"Failed to switch network architecture: {e}")
+
+        # Knowledge Lock-in: freeze segmentation decoder to preserve segmentation knowledge
+        try:
+            if self.is_ddp:
+                mod = self.network.module
+            else:
+                mod = self.network
+            if isinstance(mod, OptimizedModule):
+                mod = mod._orig_mod
+            frozen = 0
+            if hasattr(mod, 'seg_decoder') and hasattr(mod, 'reg_decoder'):
+                for p in mod.seg_decoder.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen += 1
+                self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen} parameters in seg_decoder")
+            elif hasattr(mod, 'decoder'):
+                if hasattr(mod.decoder, 'seg_layers'):
+                    for p in mod.decoder.seg_layers.parameters():
+                        if p.requires_grad:
+                            p.requires_grad = False
+                            frozen += 1
+                    self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen} parameters in decoder.seg_layers")
+                else:
+                    self.print_to_log_file("Knowledge Lock-in: single decoder without explicit seg layers; skip freezing to retain trainable params")
+            else:
+                self.print_to_log_file("Knowledge Lock-in: no decoder found, skip freezing")
+        except Exception as e:
+            self.print_to_log_file(f"Knowledge Lock-in error: {e}")
+
+        # Reconfigure optimizer to only include trainable parameters (exclude frozen seg decoder)
+        self.optimizer, self.lr_scheduler = self.configure_optimizers()
         
         # Ensure amp and amp_grad_scaler are properly initialized
         if not hasattr(self, 'amp'):
@@ -229,40 +287,28 @@ class RegnnUNetTrainer(nnUNetTrainer):
         if self.regression_values_file is None:
             self._find_regression_values_file()
         
-        # Check for the actual data directory
-        main_data_dir = join(self.preprocessed_dataset_folder, self.configuration_manager.data_identifier)
-        
-        # Debug: Print the directories and check if they exist
+        main_data_dir = self.preprocessed_dataset_folder
         self.print_to_log_file(f"Main data directory: {main_data_dir}, exists: {isdir(main_data_dir)}")
         
-        # Check if there's a duplicate nested directory (common issue)
-        nested_dir = join(main_data_dir, self.configuration_manager.data_identifier)
-        if isdir(nested_dir) and not isdir(join(main_data_dir, "tr")) and not isdir(join(main_data_dir, "val")):
-            # We have a nested directory structure, use that instead
-            self.print_to_log_file(f"Found nested directory structure: {nested_dir}")
-            main_data_dir = nested_dir
-        
         # Use the regression dataset with the main_data_dir (no tr/val folders)
-        tr_dataset = RegnnUNetDataset(
-            main_data_dir, 
-            self.regression_values_file, 
+        tr_dataset = RegDataset(
+            main_data_dir,
+            self.regression_values_file,
             self.regression_key,
             case_identifiers=tr_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0
+            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
         )
         
-        val_dataset = RegnnUNetDataset(
-            main_data_dir, 
+        val_dataset = RegDataset(
+            main_data_dir,
             self.regression_values_file,
             self.regression_key,
             case_identifiers=val_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0
+            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
         )
         
-        self.print_to_log_file(f"Created training dataset with {len(tr_dataset.keys())} cases")
-        self.print_to_log_file(f"Created validation dataset with {len(val_dataset.keys())} cases")
+        self.print_to_log_file(f"Created training dataset with {len(tr_dataset.identifiers)} cases")
+        self.print_to_log_file(f"Created validation dataset with {len(val_dataset.identifiers)} cases")
         
         return tr_dataset, val_dataset
 
@@ -287,10 +333,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
             self.patch_size,
             self.final_patch_size,
             self.label_manager,
-            self.oversample_foreground_percent,
-            memmap_mode='r',
-            num_threads_in_multithreaded=self.num_threads_in_multithreaded,
-            shuffle=True
+            oversample_foreground_percent=self.oversample_foreground_percent
         )
         
         val_loader = RegnnUNetDataLoader(
@@ -298,11 +341,8 @@ class RegnnUNetTrainer(nnUNetTrainer):
             self.batch_size,
             self.patch_size,
             self.final_patch_size,
-                                        self.label_manager,
-            0.0,  # No oversampling for validation
-            memmap_mode='r',
-            num_threads_in_multithreaded=self.num_threads_in_multithreaded,
-            shuffle=False
+            self.label_manager,
+            oversample_foreground_percent=0.0
         )
         
         # Use the MultiThreadedAugmenter like the parent class does
@@ -331,6 +371,22 @@ class RegnnUNetTrainer(nnUNetTrainer):
         _ = next(mt_gen_val)
         
         return mt_gen_train, mt_gen_val
+
+    def configure_optimizers(self):
+        if self.is_ddp:
+            mod = self.network.module
+        else:
+            mod = self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+        params = [p for p in mod.parameters() if p.requires_grad]
+        if len(params) == 0:
+            self.print_to_log_file("WARNING: No trainable parameters found after Knowledge Lock-in; falling back to all parameters")
+            params = list(mod.parameters())
+        optimizer = torch.optim.SGD(params, self.initial_lr, weight_decay=self.weight_decay,
+                                    momentum=0.99, nesterov=True)
+        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        return optimizer, lr_scheduler
 
     def train_step(self, batch: dict) -> dict:
         """
@@ -661,23 +717,28 @@ class RegnnUNetTrainer(nnUNetTrainer):
 
     def load_checkpoint(self, filename_or_checkpoint: Union[dict, str]) -> None:
         """
-        Load checkpoint with regression metrics
-        
-        Args:
-            filename_or_checkpoint: Path to the checkpoint or checkpoint dict
+        Partial load for regression fine-tuning: only encoder and segmentation decoder weights
         """
-        # Call parent method to load network weights
-        super().load_checkpoint(filename_or_checkpoint)
-        
-        # Load regression metrics if available
+        if not self.was_initialized:
+            self.initialize()
         if isinstance(filename_or_checkpoint, str):
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
             metrics_file = filename_or_checkpoint.replace('.pth', '_regression_metrics.json')
-        if isfile(metrics_file):
+        else:
+            checkpoint = filename_or_checkpoint
+            metrics_file = None
+        state = checkpoint['network_weights'] if 'network_weights' in checkpoint else checkpoint
+        filtered = {}
+        for k, v in state.items():
+            key = k[7:] if k.startswith('module.') else k
+            if key.startswith('encoder.') or key.startswith('decoder.'):
+                filtered[key] = v
+        missing, unexpected = self.network.load_state_dict(filtered, strict=False)
+        self.print_to_log_file(f"Loaded encoder+decoder weights with {len(missing)} missing, {len(unexpected)} unexpected keys")
+        if metrics_file and isfile(metrics_file):
             with open(metrics_file, 'r') as f:
                 self.regression_metrics = json.load(f)
             self.print_to_log_file(f"Loaded regression metrics from {metrics_file}")
-        else:
-            self.print_to_log_file(f"No regression metrics found at {metrics_file}")
 
     def _convert_to_npy(self, npz_file, unpack_segmentation=True, overwrite_existing=False, verify_npy=False):
         """
@@ -763,9 +824,13 @@ class RegnnUNetTrainer(nnUNetTrainer):
                 val_keys = val_keys[self.local_rank:: dist.get_world_size()]
                 # 我们不能到处设置障碍，因为每个GPU接收的keys数量可能不同
 
-            dataset_val = nnUNetDataset(self.preprocessed_dataset_folder, val_keys,
-                                      folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-                                      num_images_properties_loading_threshold=0)
+            dataset_val = RegDataset(
+                self.preprocessed_dataset_folder,
+                self.regression_values_file,
+                self.regression_key,
+                case_identifiers=val_keys,
+                folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
+            )
 
             next_stages = self.configuration_manager.next_stage_names
 
@@ -774,7 +839,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
 
             results = []
 
-            for i, k in enumerate(dataset_val.keys()):
+            for i, k in enumerate(dataset_val.identifiers):
                 proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
                                                          allowed_num_queued=2)
                 while not proceed:
@@ -783,7 +848,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
                                                              allowed_num_queued=2)
 
                 self.print_to_log_file(f"predicting {k}")
-                data, seg, properties = dataset_val.load_case(k)
+                data, seg, properties, _ = dataset_val.load_case(k)
 
                 if self.is_cascaded:
                     data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
@@ -837,9 +902,13 @@ class RegnnUNetTrainer(nnUNetTrainer):
 
                         try:
                             # 我们这样做，以便可以使用load_case而不必硬编码如何加载训练案例
-                            tmp = nnUNetDataset(expected_preprocessed_folder, [k],
-                                              num_images_properties_loading_threshold=0)
-                            d, s, p = tmp.load_case(k)
+                            tmp = RegDataset(
+                                expected_preprocessed_folder,
+                                self.regression_values_file,
+                                self.regression_key,
+                                case_identifiers=[k]
+                            )
+                            d, s, p, _ = tmp.load_case(k)
                         except FileNotFoundError:
                             self.print_to_log_file(
                                 f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
@@ -934,16 +1003,21 @@ class RegnnUNetTrainer(nnUNetTrainer):
         regression_gt = {}
         
         # 创建临时数据集对象用于加载验证集数据
-        dataset_val = nnUNetDataset(self.preprocessed_dataset_folder, val_keys,
-                                  folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-                                  num_images_properties_loading_threshold=0)
+        dataset_val = RegnnUNetDataset(
+            self.preprocessed_dataset_folder,
+            self.regression_values_file,
+            self.regression_key,
+            case_identifiers=val_keys,
+            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
+            num_images_properties_loading_threshold=0
+        )
         
         # 从数据集中加载回归值
         # 这里假设回归值存储在properties中的'regression_value'键下
         for k in val_keys:
             try:
                 # 尝试从验证集加载回归值
-                _, _, properties = dataset_val.load_case(k)
+                _, _, properties, _ = dataset_val.load_case(k)
                 if 'regression_value' in properties:
                     regression_gt[k] = float(properties['regression_value'])
             except Exception as e:

@@ -27,7 +27,7 @@ def preprocess_unlabeled_data_official(dataset_id: int = 102, configuration: str
     # 路径设置
     raw_dataset_folder = join(nnUNet_raw, dataset_name)
     preprocessed_dataset_folder = join(nnUNet_preprocessed, dataset_name)
-    unlabeled_images_folder = r"c:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\image"
+    unlabeled_images_folder = r"c:\Users\960\Desktop\nnUNet_Reg\DATASET\nnUNet_raw\Dataset102_quan\image"
     
     print(f"处理数据集: {dataset_name}")
     print(f"原始图像路径: {unlabeled_images_folder}")

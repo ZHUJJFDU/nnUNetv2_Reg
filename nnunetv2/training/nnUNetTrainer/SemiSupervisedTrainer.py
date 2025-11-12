@@ -12,6 +12,17 @@ from batchgenerators.utilities.file_and_folder_operations import load_pickle, wr
 import os
 from batchgenerators.utilities.file_and_folder_operations import join
 from nnunetv2.paths import nnUNet_preprocessed
+from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
+from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
+from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
+from batchgeneratorsv2.transforms.intensity.gaussian_noise import GaussianNoiseTransform
+from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransform
+from batchgeneratorsv2.transforms.intensity.gamma import GammaTransform
+from batchgeneratorsv2.transforms.intensity.brightness import MultiplicativeBrightnessTransform
+from batchgeneratorsv2.transforms.intensity.contrast import ContrastTransform, BGContrast
+from batchgeneratorsv2.transforms.utils.random import RandomTransform
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 
 
 class UnlabeledDataset(nnUNetBaseDataset):
@@ -90,10 +101,9 @@ class SemiSupervisedTrainer(nnUNetTrainer):
         self.configuration = configuration
         
         # 半监督学习参数
-        self.ema_decay = 0.99  # EMA衰减率
-        self.consistency_weight = 1.0  # 一致性损失权重
-        self.consistency_rampup_starts = 0  # 一致性损失开始epoch
-        self.consistency_rampup_ends = 200  # 一致性损失达到最大权重的epoch
+        self.ema_decay = 0.99
+        self.consistency_weight = 1.0
+        self.consistency_ramp_up_epochs = 100
         self.unlabeled_batch_size = 2  # 无标签数据批次大小
         self.unlabeled_data_path = None  # 无标签数据路径
         
@@ -103,13 +113,19 @@ class SemiSupervisedTrainer(nnUNetTrainer):
         # 教师模型（将在initialize中创建）
         self.teacher_model = None
         
-        # 无标签数据加载器
-        self.unlabeled_dataloader = None
+        self.unlabeled_dataloader_teacher = None
+        self.unlabeled_dataloader_student = None
+
+        # 伪标签与不确定性过滤
+        self.use_confidence_mask = True
+        self.confidence_threshold = 0.95
+        self.use_entropy_filter = False
+        self.entropy_threshold = 0.5
         
     def initialize(self):
         """初始化训练器，包括创建教师模型"""
         super().initialize()
-        
+
         # 创建教师模型（学生模型的深拷贝）
         self.teacher_model = copy.deepcopy(self.network)
         self.teacher_model.eval()
@@ -118,32 +134,22 @@ class SemiSupervisedTrainer(nnUNetTrainer):
         for param in self.teacher_model.parameters():
             param.requires_grad = False
             
-        # 初始化无标签数据加载器
+        if self.unlabeled_data_path is None:
+            raise RuntimeError('unlabeled_data_path must be explicitly provided for semi-supervised training')
         self._setup_unlabeled_dataloader()
         
     def _setup_unlabeled_dataloader(self):
-        """设置无标签数据加载器"""
         try:
-            # 获取无标签数据路径
-            if self.unlabeled_data_path is not None:
-                unlabeled_folder = self.unlabeled_data_path
-            else:
-                unlabeled_folder = join(nnUNet_preprocessed, self.dataset_json['name'], 
-                                      self.configuration)
-            
+            unlabeled_folder = self.unlabeled_data_path
             print(f"使用无标签数据路径: {unlabeled_folder}")
-            
-            # 创建无标签数据集
+
             unlabeled_dataset = UnlabeledDataset(
                 folder=unlabeled_folder,
-                identifiers=None,  # 自动获取所有标识符
+                identifiers=None,
                 folder_with_segs_from_previous_stage=None
             )
-            
-            # 获取patch_size和transforms
+
             patch_size = self.configuration_manager.patch_size
-            
-            # 获取训练时的transforms
             deep_supervision_scales = self._get_deep_supervision_scales()
             (
                 rotation_for_DA,
@@ -151,34 +157,122 @@ class SemiSupervisedTrainer(nnUNetTrainer):
                 initial_patch_size,
                 mirror_axes,
             ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
-            
-            tr_transforms = self.get_training_transforms(
-                patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
-                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-                is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
-                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-                ignore_label=self.label_manager.ignore_label)
-            
-            # 创建无标签数据加载器
-            self.unlabeled_dataloader = nnUNetDataLoader(
+
+            weak_t = self.get_unlabeled_transforms(
+                patch_size, rotation_for_DA, mirror_axes, do_dummy_2d_data_aug, strength='weak'
+            )
+            strong_t = self.get_unlabeled_transforms(
+                patch_size, rotation_for_DA, mirror_axes, do_dummy_2d_data_aug, strength='strong'
+            )
+
+            dl_t = nnUNetDataLoader(
                 unlabeled_dataset,
                 self.unlabeled_batch_size,
                 initial_patch_size,
                 patch_size,
                 self.label_manager,
-                oversample_foreground_percent=0.0,  # 无标签数据不需要前景过采样
+                oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
                 probabilistic_oversampling=False,
-                transforms=tr_transforms  # 使用训练时的数据增强
+                transforms=weak_t
             )
-            
+            dl_s = nnUNetDataLoader(
+                unlabeled_dataset,
+                self.unlabeled_batch_size,
+                initial_patch_size,
+                patch_size,
+                self.label_manager,
+                oversample_foreground_percent=0.0,
+                sampling_probabilities=None,
+                pad_sides=None,
+                probabilistic_oversampling=False,
+                transforms=strong_t
+            )
+
+            nproc = get_allowed_n_proc_DA()
+            self.unlabeled_dataloader_teacher = NonDetMultiThreadedAugmenter(
+                data_loader=dl_t, transform=None,
+                num_processes=max(1, nproc // 2), num_cached=max(3, nproc // 4), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002
+            )
+            self.unlabeled_dataloader_student = NonDetMultiThreadedAugmenter(
+                data_loader=dl_s, transform=None,
+                num_processes=max(1, nproc // 2), num_cached=max(3, nproc // 4), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002
+            )
+
+            _ = next(self.unlabeled_dataloader_teacher)
+            _ = next(self.unlabeled_dataloader_student)
             print(f"成功设置无标签数据加载器，数据量: {len(unlabeled_dataset)}")
-            
+
         except Exception as e:
             print(f"警告：无法设置无标签数据加载器: {e}")
             print("将仅使用有标签数据进行训练")
-            self.unlabeled_dataloader = None
+            self.unlabeled_dataloader_teacher = None
+            self.unlabeled_dataloader_student = None
+
+    def get_unlabeled_transforms(self,
+                                  patch_size: Union[np.ndarray, Tuple[int]],
+                                  rotation_for_DA,
+                                  mirror_axes: Tuple[int, ...],
+                                  do_dummy_2d_data_aug: bool,
+                                  strength: str = 'weak'):
+        transforms = []
+        if do_dummy_2d_data_aug:
+            ignore_axes = (0,)
+            patch_size_spatial = patch_size[1:]
+        else:
+            patch_size_spatial = patch_size
+            ignore_axes = None
+        rot_p = 0.1 if strength == 'weak' else 0.3
+        scale_range = (0.9, 1.1) if strength == 'weak' else (0.7, 1.4)
+        transforms.append(
+            SpatialTransform(
+                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
+                p_rotation=rot_p,
+                rotation=rotation_for_DA, p_scaling=0.2, scaling=scale_range, p_synchronize_scaling_across_axes=1,
+                bg_style_seg_sampling=False
+            )
+        )
+        noise_p = 0.05 if strength == 'weak' else 0.15
+        blur_p = 0.1 if strength == 'weak' else 0.25
+        gamma_p1 = 0.05 if strength == 'weak' else 0.15
+        gamma_p2 = 0.1 if strength == 'weak' else 0.3
+        brightness_p = 0.05 if strength == 'weak' else 0.15
+        contrast_p = 0.05 if strength == 'weak' else 0.15
+        transforms.append(RandomTransform(
+            GaussianNoiseTransform(noise_variance=(0, 0.1), p_per_channel=1, synchronize_channels=True),
+            apply_probability=noise_p
+        ))
+        transforms.append(RandomTransform(
+            GaussianBlurTransform(blur_sigma=(0.5, 1.), synchronize_channels=False, synchronize_axes=False,
+                                  p_per_channel=0.5, benchmark=True),
+            apply_probability=blur_p
+        ))
+        transforms.append(RandomTransform(
+            MultiplicativeBrightnessTransform(multiplier_range=BGContrast((0.85, 1.15)),
+                                              synchronize_channels=False, p_per_channel=1),
+            apply_probability=brightness_p
+        ))
+        transforms.append(RandomTransform(
+            ContrastTransform(contrast_range=BGContrast((0.85, 1.15)), preserve_range=True,
+                              synchronize_channels=False, p_per_channel=1),
+            apply_probability=contrast_p
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(gamma=BGContrast((0.8, 1.3)), p_invert_image=1, synchronize_channels=False,
+                           p_per_channel=1, p_retain_stats=1),
+            apply_probability=gamma_p1
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(gamma=BGContrast((0.8, 1.3)), p_invert_image=0, synchronize_channels=False,
+                           p_per_channel=1, p_retain_stats=1),
+            apply_probability=gamma_p2
+        ))
+        if mirror_axes is not None and len(mirror_axes) > 0:
+            transforms.append(MirrorTransform(allowed_axes=mirror_axes))
+        return ComposeTransforms(transforms)
     
     def update_teacher_model(self):
         """使用EMA更新教师模型权重"""
@@ -189,29 +283,38 @@ class SemiSupervisedTrainer(nnUNetTrainer):
                                     (1 - self.ema_decay) * student_param.data)
     
     def get_consistency_weight(self, epoch: int) -> float:
-        """计算当前epoch的一致性损失权重"""
-        if epoch < self.consistency_rampup_starts:
+        if epoch <= 0:
             return 0.0
-        elif epoch >= self.consistency_rampup_ends:
+        if self.consistency_ramp_up_epochs <= 0:
             return self.consistency_weight
-        else:
-            # 线性增长
-            rampup_length = self.consistency_rampup_ends - self.consistency_rampup_starts
-            current_rampup = epoch - self.consistency_rampup_starts
-            return self.consistency_weight * (current_rampup / rampup_length)
+        w = min(1.0, epoch / float(self.consistency_ramp_up_epochs))
+        return self.consistency_weight * w
     
     def compute_consistency_loss(self, student_output, teacher_output):
-        """计算一致性损失"""
-        # 使用MSE损失
-        return F.mse_loss(student_output, teacher_output)
+        if not self.use_confidence_mask and not self.use_entropy_filter:
+            return F.mse_loss(student_output, teacher_output)
+        t_prob = torch.softmax(teacher_output, dim=1)
+        s_prob = torch.softmax(student_output, dim=1)
+        if self.use_entropy_filter:
+            entropy = -torch.sum(t_prob * torch.log(t_prob.clamp_min(1e-8)), dim=1, keepdim=True)
+            mask = (entropy <= self.entropy_threshold)
+        else:
+            max_prob = torch.max(t_prob, dim=1, keepdim=True)[0]
+            mask = (max_prob >= self.confidence_threshold)
+        mask = mask.float()
+        diff = (s_prob - t_prob) ** 2
+        diff = diff * mask
+        valid = mask.sum()
+        if valid.item() == 0:
+            return torch.tensor(0.0, device=student_output.device)
+        return diff.sum() / (valid + 1e-6)
     
     def train_step(self, batch: dict) -> dict:
         """重写训练步骤，加入半监督学习逻辑"""
         # 标准的监督学习步骤
         supervised_loss_dict = super().train_step(batch)
         
-        # 如果没有无标签数据，返回监督损失
-        if self.unlabeled_dataloader is None:
+        if self.unlabeled_dataloader_teacher is None or self.unlabeled_dataloader_student is None:
             return supervised_loss_dict
         
         # 获取一致性损失权重
@@ -221,22 +324,20 @@ class SemiSupervisedTrainer(nnUNetTrainer):
             return supervised_loss_dict
         
         try:
-            # 获取无标签数据
-            unlabeled_batch = next(self.unlabeled_dataloader)
-            unlabeled_data = unlabeled_batch['data'].to(self.device, non_blocking=True)
-            
-            # 教师模型预测（弱增强）
+            t_batch = next(self.unlabeled_dataloader_teacher)
+            s_batch = next(self.unlabeled_dataloader_student)
+            t_data = t_batch['data'].to(self.device, non_blocking=True)
+            s_data = s_batch['data'].to(self.device, non_blocking=True)
+
             with torch.no_grad():
                 with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-                    teacher_output = self.teacher_model(unlabeled_data)
+                    teacher_output = self.teacher_model(t_data)
             
-            # 学生模型预测（强增强，这里简化为同样的数据）
             with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-                student_output = self.network(unlabeled_data)
+                student_output = self.network(s_data)
             
             # 计算一致性损失
             if self.enable_deep_supervision:
-                # 如果启用深度监督，只使用最高分辨率的输出
                 consistency_loss = self.compute_consistency_loss(student_output[0], teacher_output[0])
             else:
                 consistency_loss = self.compute_consistency_loss(student_output, teacher_output)
@@ -300,33 +401,11 @@ class SemiSupervisedTrainer(nnUNetTrainer):
             print(f"教师模型已保存到: {teacher_filename}")
     
     def load_checkpoint(self, filename_or_checkpoint: Union[dict, str]) -> None:
-        """加载检查点，包括教师模型"""
+        """加载检查点并初始化教师模型权重为同一文件"""
         super().load_checkpoint(filename_or_checkpoint)
-        
-        # 加载教师模型
-        if isinstance(filename_or_checkpoint, str):
-            # 首先尝试加载专门的教师模型文件
-            teacher_filename = filename_or_checkpoint.replace('.pth', '_teacher.pth')
-            teacher_loaded = False
-            
-            try:
-                teacher_checkpoint = torch.load(teacher_filename, map_location=self.device, weights_only=False)
-                if self.teacher_model is not None:
-                    self.teacher_model.load_state_dict(teacher_checkpoint['teacher_model_state_dict'])
-                    self.ema_decay = teacher_checkpoint.get('ema_decay', self.ema_decay)
-                    print(f"教师模型已从 {teacher_filename} 加载")
-                    teacher_loaded = True
-            except FileNotFoundError:
-                print(f"未找到教师模型文件: {teacher_filename}")
-            except Exception as e:
-                print(f"加载教师模型时出错: {e}")
-            
-            # 如果没有专门的教师模型文件，使用主模型文件初始化教师模型
-            if not teacher_loaded:
-                try:
-                    print(f"使用主模型文件初始化教师模型: {filename_or_checkpoint}")
-                    if self.teacher_model is not None:
-                        self.teacher_model.load_state_dict(self.network.state_dict())
-                        print("教师模型已用学生模型权重初始化")
-                except Exception as e:
-                    print(f"初始化教师模型时出错: {e}")
+        try:
+            if self.teacher_model is not None:
+                self.teacher_model.load_state_dict(self.network.state_dict())
+                print("教师模型已用学生模型权重初始化")
+        except Exception as e:
+            print(f"初始化教师模型时出错: {e}")
