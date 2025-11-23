@@ -108,8 +108,62 @@ def main(folder1, folder2, num_classes=3):
     return results, avg_dice, avg_iou, avg_recall
 
 if __name__ == "__main__":
-    folder1 = r'C:\Users\Administrator\Desktop\nnUNet-master\DATASET\nnUNet_raw\Dataset103_new\labelsTs'
-    folder2 = r'C:\Users\Administrator\Desktop\2\after'
+    folder1 = r'C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\labelsTs'
+    folder2 = r'C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\Regoutput'
     num_classes = 3  # 根据你的标签类别数量设置
 
     results, avg_dice, avg_iou, avg_recall = main(folder1, folder2, num_classes)
+
+### 原版
+# File: ATM_729.nii.gz
+#   Class 1 - Dice: 0.8930, IoU: 0.8067, Recall: 0.9414
+#   Class 2 - Dice: 0.8149, IoU: 0.6876, Recall: 0.8271
+#   Class 3 - Dice: 0.3248, IoU: 0.1939, Recall: 0.2878
+# --------------------------------------------------
+# File: ATM_731.nii.gz
+#   Class 1 - Dice: 0.8951, IoU: 0.8102, Recall: 0.9161
+#   Class 2 - Dice: 0.8203, IoU: 0.6954, Recall: 0.9242
+#   Class 3 - Dice: 0.4238, IoU: 0.2689, Recall: 0.4088
+# --------------------------------------------------
+# File: ATM_732.nii.gz
+#   Class 1 - Dice: 0.8944, IoU: 0.8089, Recall: 0.9497
+#   Class 2 - Dice: 0.8856, IoU: 0.7947, Recall: 0.8288
+#   Class 3 - Dice: 0.4592, IoU: 0.2981, Recall: 0.3941
+# --------------------------------------------------
+# File: ATM_734.nii.gz
+#   Class 1 - Dice: 0.8998, IoU: 0.8178, Recall: 0.9223
+#   Class 2 - Dice: 0.9091, IoU: 0.8334, Recall: 0.9122
+#   Class 3 - Dice: 0.5460, IoU: 0.3755, Recall: 0.4996
+# --------------------------------------------------
+
+# Overall Statistics:
+#   Class 1 - Average Dice: 0.8956, Average IoU: 0.8109, Average Recall: 0.9324
+#   Class 2 - Average Dice: 0.8575, Average IoU: 0.7528, Average Recall: 0.8731
+#   Class 3 - Average Dice: 0.4385, Average IoU: 0.2841, Average Recall: 0.3976
+
+
+### 回归
+#   Class 1 - Dice: 0.8780, IoU: 0.7825, Recall: 0.9413
+#   Class 2 - Dice: 0.8265, IoU: 0.7043, Recall: 0.8135
+#   Class 3 - Dice: 0.3232, IoU: 0.1927, Recall: 0.2884
+# --------------------------------------------------
+# File: ATM_731.nii.gz
+#   Class 1 - Dice: 0.8967, IoU: 0.8127, Recall: 0.9122
+#   Class 2 - Dice: 0.8324, IoU: 0.7130, Recall: 0.9089
+#   Class 3 - Dice: 0.4142, IoU: 0.2612, Recall: 0.3950
+# --------------------------------------------------
+# File: ATM_732.nii.gz
+#   Class 1 - Dice: 0.8916, IoU: 0.8044, Recall: 0.9465
+#   Class 2 - Dice: 0.8854, IoU: 0.7944, Recall: 0.8236
+#   Class 3 - Dice: 0.4511, IoU: 0.2913, Recall: 0.3973
+# --------------------------------------------------
+# File: ATM_734.nii.gz
+#   Class 1 - Dice: 0.8943, IoU: 0.8087, Recall: 0.9151
+#   Class 2 - Dice: 0.9024, IoU: 0.8222, Recall: 0.9021
+#   Class 3 - Dice: 0.5329, IoU: 0.3633, Recall: 0.4922
+# --------------------------------------------------
+
+# Overall Statistics:
+#   Class 1 - Average Dice: 0.8901, Average IoU: 0.8021, Average Recall: 0.9288
+#   Class 2 - Average Dice: 0.8617, Average IoU: 0.7585, Average Recall: 0.8620
+#   Class 3 - Average Dice: 0.4304, Average IoU: 0.2771, Average Recall: 0.3932

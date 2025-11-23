@@ -141,11 +141,13 @@ def run_ddp(rank,
             val,
             teacher_checkpoint,
             world_size,
-            semi_kwargs):
+            semi_kwargs,
+            num_epochs):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
     nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p)
+    nnunet_trainer.num_epochs = num_epochs
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -188,6 +190,7 @@ def run_semi_training(dataset_name_or_id: Union[str, int],
                       only_run_validation: bool = False,
                       disable_checkpointing: bool = False,
                       val_with_best: bool = False,
+                      num_epochs: int = 1000,
                       device: torch.device = torch.device('cuda')):
     if isinstance(fold, str):
         if fold != 'all':
@@ -226,12 +229,13 @@ def run_semi_training(dataset_name_or_id: Union[str, int],
         mp.spawn(run_ddp,
                  args=(dataset_name_or_id, configuration, fold, trainer_class_name, plans_identifier,
                        disable_checkpointing, continue_training, only_run_validation, teacher_checkpoint,
-                       num_gpus, semi_kwargs),
+                       num_gpus, semi_kwargs, num_epochs),
                  nprocs=num_gpus,
                  join=True)
     else:
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, device=device)
+        nnunet_trainer.num_epochs = num_epochs
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -279,6 +283,7 @@ def run_semi_training_entry():
     parser.add_argument('--val_best', action='store_true', required=False)
     parser.add_argument('--disable_checkpointing', action='store_true', required=False)
     parser.add_argument('-device', type=str, default='cuda', required=False)
+    parser.add_argument('-a_num_epochs', type=int, default=200, help="The number of epochs for training.")
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps']
@@ -297,7 +302,7 @@ def run_semi_training_entry():
                       args.consistency_weight, args.ema_decay, args.consistency_ramp_up_epochs, args.save_interval,
                       args.use_confidence_mask, args.confidence_threshold, args.use_entropy_filtering,
                       args.entropy_threshold, args.num_gpus, args.c, args.val, args.disable_checkpointing,
-                      args.val_best, device=device)
+                      args.val_best, device=device, num_epochs=args.num_epochs)
 
 
 if __name__ == '__main__':

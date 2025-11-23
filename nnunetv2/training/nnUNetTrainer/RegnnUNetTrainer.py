@@ -78,7 +78,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
         self.num_threads_in_multithreaded = get_allowed_n_proc_DA()
         
         # 恢复AMP设置，不再强制关闭
-        # self.amp = False
+        self.amp = True
         
         # Set deep supervision attribute
         self.deep_supervision = True
@@ -116,7 +116,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
             if 'n_blocks_per_stage' in arch_kwargs and 'n_conv_per_stage' not in arch_kwargs:
                 arch_kwargs['n_conv_per_stage'] = arch_kwargs.pop('n_blocks_per_stage')
             arch_kwargs['regression_dim'] = 1
-            arch_kwargs['enable_cross_attention'] = True
+            arch_kwargs['enable_cross_attention'] = False
             req_import = self.configuration_manager.network_arch_init_kwargs_req_import
             new_net = get_network_from_plans(
                 arch_class_name,
@@ -132,7 +132,7 @@ class RegnnUNetTrainer(nnUNetTrainer):
         except Exception as e:
             self.print_to_log_file(f"Failed to switch network architecture: {e}")
 
-        # Knowledge Lock-in: freeze segmentation decoder to preserve segmentation knowledge
+        # Knowledge Lock-in: freeze segmentation decoder and encoder to preserve segmentation and feature extraction knowledge
         try:
             if self.is_ddp:
                 mod = self.network.module
@@ -140,28 +140,37 @@ class RegnnUNetTrainer(nnUNetTrainer):
                 mod = self.network
             if isinstance(mod, OptimizedModule):
                 mod = mod._orig_mod
-            frozen = 0
+
+            frozen_seg = 0
             if hasattr(mod, 'seg_decoder') and hasattr(mod, 'reg_decoder'):
                 for p in mod.seg_decoder.parameters():
                     if p.requires_grad:
                         p.requires_grad = False
-                        frozen += 1
-                self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen} parameters in seg_decoder")
+                        frozen_seg += 1
+                self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen_seg} parameters in seg_decoder")
             elif hasattr(mod, 'decoder'):
-                if hasattr(mod.decoder, 'seg_layers'):
-                    for p in mod.decoder.seg_layers.parameters():
-                        if p.requires_grad:
-                            p.requires_grad = False
-                            frozen += 1
-                    self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen} parameters in decoder.seg_layers")
-                else:
-                    self.print_to_log_file("Knowledge Lock-in: single decoder without explicit seg layers; skip freezing to retain trainable params")
+                for p in mod.decoder.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen_seg += 1
+                self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen_seg} parameters in decoder")
             else:
-                self.print_to_log_file("Knowledge Lock-in: no decoder found, skip freezing")
+                self.print_to_log_file("Knowledge Lock-in: no seg_decoder found, skip freezing")
+
+            frozen_enc = 0
+            if hasattr(mod, 'encoder'):
+                for p in mod.encoder.parameters():
+                    if p.requires_grad:
+                        p.requires_grad = False
+                        frozen_enc += 1
+                self.print_to_log_file(f"Knowledge Lock-in: frozen {frozen_enc} parameters in encoder")
+            else:
+                self.print_to_log_file("Knowledge Lock-in: no encoder found, skip freezing")
+
         except Exception as e:
             self.print_to_log_file(f"Knowledge Lock-in error: {e}")
 
-        # Reconfigure optimizer to only include trainable parameters (exclude frozen seg decoder)
+        # Reconfigure optimizer to only include trainable parameters (exclude frozen modules)
         self.optimizer, self.lr_scheduler = self.configure_optimizers()
         
         # Ensure amp and amp_grad_scaler are properly initialized
@@ -183,6 +192,40 @@ class RegnnUNetTrainer(nnUNetTrainer):
         self.print_to_log_file(f"  - Regression weight: {self.regression_weight}")
         self.print_to_log_file(f"  - Regression loss type: {self.regression_loss_type}")
         self.print_to_log_file(f"  - Regression key: {self.regression_key}")
+
+        try:
+            if self.is_ddp:
+                mod = self.network.module
+            else:
+                mod = self.network
+            if isinstance(mod, OptimizedModule):
+                mod = mod._orig_mod
+            if hasattr(mod, 'encoder'):
+                mod.encoder.eval()
+            if hasattr(mod, 'seg_decoder'):
+                mod.seg_decoder.eval()
+            elif hasattr(mod, 'decoder'):
+                mod.decoder.eval()
+        except Exception:
+            pass
+
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        try:
+            if self.is_ddp:
+                mod = self.network.module
+            else:
+                mod = self.network
+            if isinstance(mod, OptimizedModule):
+                mod = mod._orig_mod
+            if hasattr(mod, 'encoder'):
+                mod.encoder.eval()
+            if hasattr(mod, 'seg_decoder'):
+                mod.seg_decoder.eval()
+            elif hasattr(mod, 'decoder'):
+                mod.decoder.eval()
+        except Exception:
+            pass
 
     def _find_regression_values_file(self):
         """

@@ -44,9 +44,13 @@ def main():
     parser.add_argument('--pretrained_weights', type=str, default=None, help='半监督阶段的检查点路径')
     parser.add_argument('--reg_weight', type=float, default=1.0, help='回归损失权重')
     parser.add_argument('--reg_key', type=str, default='bulla_thickness', help='回归值键名')
+    parser.add_argument('--epochs', type=int, default=200, help='训练的总轮数 (默认: 200)')
     args = parser.parse_args()
 
     trainer = get_reg_trainer(args.dataset, args.configuration, args.fold, args.device)
+
+    # 设置训练的总轮数
+    trainer.num_epochs = args.epochs
 
     trainer.initialize()
     trainer.set_regression_parameters(reg_weight=args.reg_weight, reg_key=args.reg_key, debug=True)

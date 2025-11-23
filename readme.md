@@ -60,16 +60,18 @@ python run_semi_training.py Dataset102_quan 3d_fullres 0 -teacher_checkpoint C:\
 
 - 阶段3：双解码器回归（知识锁定）
 ```
-python run_regression_training.py \
-  -d Dataset102_quan -c 3d_fullres -f 0 --device cuda \
-  --pretrained_weights C:\path\to\...\SemiSupervisedTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_latest.pth \
-  --reg_weight 1.0 --reg_key bulla_thickness
+python run_regression_training.py -d Dataset102_quan -c 3d_fullres -f 0 --device cuda --pretrained_weights C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_trained_models\Dataset102_quan\SemiSupervisedTrainer__nnUNetPlans__3d_fullres\fold_0\checkpoint_latest.pth --reg_weight 1.0 --reg_key bulla_thickness
+
 ```
 说明：第三阶段切换 `DualDecoderRegCBAMUNet`，仅加载编码器与分割解码器权重并冻结分割解码器。
 
 ## 推理
 ```
-python regression_inference.py -i <input_folder> -o <output_folder> -m <model_folder> -c checkpoint_final.pth
+nnUNetv2_predict -d 102 -i C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\imagesTs -o C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\output -f 0 -tr nnUNetTrainer_500epochs -c 3d_fullres -p nnUNetPlans --save_probabilities
+
+
+
+python regression_inference.py -d 102 -i C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\imagesTs -o C:\Users\Administrator\Desktop\nnUNet_master\DATASET\nnUNet_raw\Dataset102_quan\Regoutput -f 0      
 ```
 输出：分割结果与 `<output_folder>/regression_results.json`。
 
